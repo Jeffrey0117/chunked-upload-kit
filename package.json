@@ -3,10 +3,49 @@
   "version": "0.1.0",
   "description": "Chunked/resumable file upload — zero-dep server store + fastify/express adapters + browser/Node client. Gets large files past proxies that cap request bodies (e.g. Cloudflare 100MB).",
   "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./client": {
+      "types": "./client/index.d.mts",
+      "default": "./client/index.mjs"
+    },
+    "./fastify": "./src/adapters/fastify.js",
+    "./express": "./src/adapters/express.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "src",
+    "client",
+    "example.js",
+    "README.md",
+    "SKILL.md"
+  ],
   "scripts": {
+    "test": "node --test test/*.test.mjs",
     "example": "node example.js"
   },
-  "keywords": [],
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "express": "^4.21.0",
+    "fastify": "^5.0.0"
+  },
+  "keywords": [
+    "upload",
+    "chunked-upload",
+    "resumable",
+    "large-files",
+    "cloudflare",
+    "fastify",
+    "express"
+  ],
   "author": "Jeffrey0117",
   "license": "MIT"
 }
