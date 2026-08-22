@@ -53,6 +53,7 @@ description: 任何「上傳大檔（影片/壓縮包/>50MB）到自家服務」
 
 - **chunkSize / maxChunkSize 超過 proxy 上限整套白做**（CF 非 Enterprise = 100MB/request）。預設 32MB 上限是刻意的。
 - fastify 的 `application/octet-stream` parser 是 plugin 內部註冊（encapsulated），host app 不會被改行為；但如果你把 `registerChunkedUpload` 包在 `fastify-plugin` 裡就會外洩 — 別包。
+- **`onComplete` 要「回傳物件」，不要自己 `reply.send()` / `res.json()`**：adapter 是先 release session 再送回應；你自己先送，client 會在 temp 還沒清掉時就收到 200（測試一定抓到）。要改 status code 用 `reply.status(400)` 然後 return body（fastify 會沿用）。
 - `onComplete` 拿到的 `file.path` 在回傳後就被刪；要保留就在 `onComplete` 裡 rename/copy 走，別把 path 存進 DB。
 - 跑在 PM2/Windows：session 目錄放在資料目錄裡（`data/chunks`），別放 `os.tmpdir()`（部署會清、跨槽 rename 會變 copy）。
 - 本地 SQLite / 本地檔案的專案（pokkit、lurlhub）**不能開 cloudpipe `slotDeploy`**，chunks 目錄也一樣會被刷掉 — 這不是 kit 的問題，是部署模式。
