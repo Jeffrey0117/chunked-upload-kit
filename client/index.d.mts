@@ -18,10 +18,14 @@ export interface UploadOptions {
   /** Retries per chunk on network/408/429/5xx. Default 3. */
   retries?: number
   retryDelayMs?: number
+  /** Per-chunk XHR timeout in ms (browser only). Default 120000; 0 disables. */
+  chunkTimeoutMs?: number
   onProgress?: (p: UploadProgress) => void
   signal?: AbortSignal
-  /** Arbitrary JSON passed to the server's onComplete. */
+  /** Arbitrary JSON stored with the session (on disk until complete) and passed to onComplete as file.meta. */
   meta?: Record<string, unknown>
+  /** JSON sent only with the final /complete request (req.completeBody) — use for secrets like passwords. */
+  completeBody?: Record<string, unknown>
   /** Hex sha256 of the file for server-side verification. */
   sha256?: string
   /** Override file.name / file.type. */
@@ -38,8 +42,10 @@ export class UploadError extends Error {
   status: number
   code: string
   body: unknown
-  /** Set whenever a session exists — keep it to resume. */
+  /** Set whenever a session exists. */
   uploadId: string | null
+  /** true when the session should still exist server-side (network/5xx/abort) — keep uploadId to resume; false → start over. */
+  resumable: boolean
 }
 
 /** Upload a Blob/File in chunks. Resolves with the server's /complete JSON. */

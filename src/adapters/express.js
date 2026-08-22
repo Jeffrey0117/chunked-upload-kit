@@ -1,12 +1,13 @@
 'use strict';
 // Express / plain-http adapter. Zero deps: parses its own JSON for /init and
-// streams chunk bodies straight into the store, so it does not care whether
-// `express.json()` is mounted. Mount it at a prefix:
+// /complete and streams chunk bodies straight into the store, so it does not
+// care whether `express.json()` is mounted. Mount it at a prefix:
 //
-//   app.use('/api/upload/chunked', chunkedUploadHandler({ store, auth, onComplete }))
+//   app.use('/api/upload/chunked', chunkedUploadHandler({ store, auth, onInit, onComplete }))
 //
-// auth(req, res) → ownerId | null   (null → 401; send your own response if you prefer)
-// onComplete(file, req, res) → json (file = store.complete() result)
+// auth(req, res) → ownerId | null (→ 401) | false ("I already replied")
+// onInit(body, owner, req, res)   → optional; throw ChunkError to refuse
+// onComplete(file, req, res) → json (file = store.complete() result; RETURN, don't send)
 
 const { ChunkError } = require('../store');
 
@@ -15,6 +16,7 @@ const MAX_JSON = 64 * 1024;
 function readJson(req) {
   return new Promise((resolve, reject) => {
     if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) return resolve(req.body);
+    const ct = String(req.headers['content-type'] || '');
     const chunks = [];
     let size = 0;
     req.on('data', (c) => {
@@ -27,7 +29,7 @@ function readJson(req) {
       chunks.push(c);
     });
     req.on('end', () => {
-      if (!chunks.length) return resolve({});
+      if (!chunks.length || !/json/i.test(ct)) return resolve({});
       try {
         resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
       } catch (_) {
@@ -45,6 +47,10 @@ function json(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
+function drain(req) {
+  if (!req.readableEnded && !req.destroyed) req.resume();
+}
+
 function sendError(res, err, log) {
   if (err instanceof ChunkError) return json(res, err.status, err.toJSON());
   if (log) log('chunked-upload: unexpected error', err);
@@ -52,7 +58,7 @@ function sendError(res, err, log) {
 }
 
 function chunkedUploadHandler(opts = {}) {
-  const { store, onComplete } = opts;
+  const { store, onComplete, onInit } = opts;
   const auth = opts.auth || (async () => null);
   const log = opts.log || ((...a) => console.error(...a));
   if (!store) throw new Error('chunkedUploadHandler: `store` is required');
@@ -68,6 +74,7 @@ function chunkedUploadHandler(opts = {}) {
 
   async function resolveOwner(req, res) {
     const owner = await auth(req, res);
+    if (owner === false || res.headersSent) return undefined;
     if (owner === null || owner === undefined) {
       json(res, 401, { error: 'Unauthorized', code: 'unauthorized' });
       return undefined;
@@ -77,6 +84,8 @@ function chunkedUploadHandler(opts = {}) {
 
   async function handleInit(req, res, _m, owner) {
     const body = await readJson(req);
+    if (onInit) await onInit(body, owner, req, res);
+    if (res.headersSent) return;
     json(res, 200, await store.init(body, owner));
   }
   async function handleStatus(req, res, m, owner) {
@@ -85,9 +94,15 @@ function chunkedUploadHandler(opts = {}) {
   async function handlePut(req, res, m, owner) {
     const len = Number(req.headers['content-length']);
     const hint = Number.isInteger(len) ? { length: len } : {};
-    json(res, 200, await store.putChunk(m[1], m[2], req, owner, hint));
+    try {
+      json(res, 200, await store.putChunk(m[1], m[2], req, owner, hint));
+    } catch (err) {
+      drain(req);
+      throw err;
+    }
   }
   async function handleComplete(req, res, m, owner) {
+    req.completeBody = await readJson(req);
     const file = await store.complete(m[1], owner);
     let result;
     let failure;
@@ -102,6 +117,7 @@ function chunkedUploadHandler(opts = {}) {
     if (!res.headersSent) json(res, 200, result === undefined ? { ok: true } : result);
   }
   async function handleAbort(req, res, m, owner) {
+    drain(req);
     json(res, 200, await store.abort(m[1], owner));
   }
 
@@ -116,7 +132,7 @@ function chunkedUploadHandler(opts = {}) {
     const m = route.re.exec(rawPath);
     (async () => {
       const owner = await resolveOwner(req, res);
-      if (owner === undefined) return;
+      if (owner === undefined) { drain(req); return; }
       await route.fn(req, res, m, owner);
     })().catch((err) => sendError(res, err, log));
   };

@@ -167,6 +167,64 @@ test('sweep removes expired sessions only and ignores junk', async () => {
   await store.status(fresh.uploadId, 'u1')
 })
 
+test('sanitizeFilename blocks traversal, dotfiles, Windows illegal chars and device names', async () => {
+  const { sanitizeFilename } = await import('../index.js')
+  assert.equal(sanitizeFilename('..'), '')
+  assert.equal(sanitizeFilename('.'), '')
+  assert.equal(sanitizeFilename('..\\..\\x.txt'), 'x.txt')
+  assert.equal(sanitizeFilename('.env'), 'env')
+  assert.equal(sanitizeFilename('report.txt:$DATA'), 'report.txt_$DATA')
+  assert.equal(sanitizeFilename('CON'), '_CON')
+  assert.equal(sanitizeFilename('nul.txt'), '_nul.txt')
+  assert.equal(sanitizeFilename('trailing. . '), 'trailing')
+  assert.equal(sanitizeFilename('a<b>c|d?e*f"g'), 'a_b_c_d_e_f_g')
+  assert.equal(sanitizeFilename('正常 檔名.mp4'), '正常 檔名.mp4')
+})
+
+test('concurrent complete() is single-flight: both callers get the same result, file intact', async () => {
+  const data = rand(12 * KB)
+  const s = await store.init({ filename: 'race.bin', size: data.length }, 'u1')
+  for (let i = 0; i < 3; i++) await store.putChunk(s.uploadId, i, data.subarray(i * 4 * KB, (i + 1) * 4 * KB), 'u1')
+  const [a, b] = await Promise.all([store.complete(s.uploadId, 'u1'), store.complete(s.uploadId, 'u1')])
+  assert.equal(a.path, b.path)
+  assert.equal(a.sha256, sha(data))
+  assert.equal(b.sha256, sha(data))
+  assert.ok(Buffer.from(fs.readFileSync(a.path)).equals(data))
+  // a late joiner with the wrong owner is still refused
+  const s2 = await store.init({ filename: 'race2.bin', size: 3 * KB }, 'u1')
+  await store.putChunk(s2.uploadId, 0, rand(3 * KB), 'u1')
+  const p = store.complete(s2.uploadId, 'u1')
+  await rejects(store.complete(s2.uploadId, 'u2'), 403, 'forbidden')
+  const ok = await p
+  await a.release()
+  await ok.release()
+})
+
+test('putChunk / abort during complete → 409 completing', async () => {
+  const data = rand(4 * KB)
+  const s = await store.init({ filename: 'c.bin', size: data.length }, 'u1')
+  await store.putChunk(s.uploadId, 0, data, 'u1')
+  const p = store.complete(s.uploadId, 'u1')
+  await rejects(store.putChunk(s.uploadId, 0, data, 'u1'), 409, 'completing')
+  await rejects(store.abort(s.uploadId, 'u1'), 409, 'completing')
+  const done = await p
+  await done.release()
+})
+
+test('per-owner in-flight session cap → 429, and the cap survives a restart', async () => {
+  const capDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cuk-cap-'))
+  const capped = createChunkStore({ dir: capDir, maxSessionsPerOwner: 2 })
+  const a = await capped.init({ filename: 'a', size: 1 }, 'owner-x')
+  await capped.init({ filename: 'b', size: 1 }, 'owner-x')
+  await rejects(capped.init({ filename: 'c', size: 1 }, 'owner-x'), 429, 'too_many_sessions')
+  await capped.init({ filename: 'c', size: 1 }, 'owner-y') // other owner unaffected
+  const restarted = createChunkStore({ dir: capDir, maxSessionsPerOwner: 2 })
+  await rejects(restarted.init({ filename: 'd', size: 1 }, 'owner-x'), 429, 'too_many_sessions')
+  await restarted.abort(a.uploadId, 'owner-x')
+  await restarted.init({ filename: 'd', size: 1 }, 'owner-x')
+  fs.rmSync(capDir, { recursive: true, force: true })
+})
+
 test('too many chunks → 400', async () => {
   const tiny = createChunkStore({ dir, defaultChunkSize: KB, maxChunkSize: KB, maxFileSize: 100 * KB, maxChunks: 4 })
   await rejects(tiny.init({ filename: 'a.bin', size: 10 * KB }, 'u1'), 400, 'too_many_chunks')

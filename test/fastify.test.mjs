@@ -5,7 +5,7 @@ import path from 'node:path'
 import fs from 'node:fs'
 import crypto from 'node:crypto'
 import Fastify from 'fastify'
-import { createChunkStore, registerChunkedUpload } from '../index.js'
+import { createChunkStore, registerChunkedUpload, ChunkError } from '../index.js'
 
 const KB = 1024
 let app
@@ -127,6 +127,65 @@ test('onComplete throwing → 500 and the session is still released', async () =
   assert.ok(!fs.existsSync(path.join(store2.dir, s2.uploadId)))
   await app2.close()
   fs.rmSync(store2.dir, { recursive: true, force: true })
+})
+
+test('onInit can refuse before any byte lands; completeBody reaches onComplete', async () => {
+  const app3 = Fastify({ logger: false })
+  const store3 = createChunkStore({ dir: fs.mkdtempSync(path.join(os.tmpdir(), 'cuk-f3-')), defaultChunkSize: KB, maxChunkSize: KB })
+  const seen = []
+  registerChunkedUpload(app3, {
+    prefix: '/u',
+    store: store3,
+    auth: () => 'x',
+    onInit: (body, owner) => { if (body.meta?.album === 'locked') throw new ChunkError(403, 'no_album', 'nope') },
+    onComplete: async (file, req) => { seen.push(req.completeBody); return { ok: 1 } },
+  })
+  await app3.ready()
+  const refused = await app3.inject({ method: 'POST', url: '/u/init', headers: { 'content-type': 'application/json' }, payload: JSON.stringify({ filename: 'a', size: 3, meta: { album: 'locked' } }) })
+  assert.equal(refused.statusCode, 403)
+  assert.equal(refused.json().code, 'no_album')
+  assert.equal(fs.readdirSync(store3.dir).length, 0, 'no session dir created')
+
+  const s = (await app3.inject({ method: 'POST', url: '/u/init', headers: { 'content-type': 'application/json' }, payload: JSON.stringify({ filename: 'a', size: 3 }) })).json()
+  await app3.inject({ method: 'PUT', url: `/u/${s.uploadId}/0`, headers: { 'content-type': 'application/octet-stream' }, payload: Buffer.from('abc') })
+  const c = await app3.inject({ method: 'POST', url: `/u/${s.uploadId}/complete`, headers: { 'content-type': 'application/json' }, payload: JSON.stringify({ password: 'hunter2' }) })
+  assert.equal(c.statusCode, 200, c.body)
+  assert.deepEqual(seen, [{ password: 'hunter2' }])
+  await app3.close()
+  fs.rmSync(store3.dir, { recursive: true, force: true })
+})
+
+test('real socket: body-less POST /complete re-framed as chunked (proxy style) still works; early PUT error is delivered', async () => {
+  const app4 = Fastify({ logger: false })
+  const store4 = createChunkStore({ dir: fs.mkdtempSync(path.join(os.tmpdir(), 'cuk-f4-')), defaultChunkSize: 64 * KB, maxChunkSize: 64 * KB })
+  registerChunkedUpload(app4, { prefix: '/u', store: store4, auth: (req) => (req.headers.authorization ? 'x' : null), onComplete: async (f) => ({ size: f.size }) })
+  await app4.listen({ port: 0, host: '127.0.0.1' })
+  const port = app4.server.address().port
+  const { default: http } = await import('node:http')
+  const raw = (method, p, headers, body) => new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, method, path: p, headers }, (res) => {
+      let t = ''
+      res.on('data', (d) => { t += d })
+      res.on('end', () => resolve({ status: res.statusCode, body: t }))
+    })
+    req.on('error', reject)
+    if (body) req.write(body)
+    req.end()
+  })
+  const s = JSON.parse((await raw('POST', '/u/init', { authorization: 'k', 'content-type': 'application/json' }, JSON.stringify({ filename: 'a', size: 3 }))).body)
+  await raw('PUT', `/u/${s.uploadId}/0`, { authorization: 'k', 'content-type': 'application/octet-stream', 'content-length': '3' }, 'abc')
+  // what Cloudflare/tunnel/proxy chains do to a body-less POST: no content-type, chunked framing
+  const c = await raw('POST', `/u/${s.uploadId}/complete`, { authorization: 'k', 'transfer-encoding': 'chunked' }, '')
+  assert.equal(c.status, 200, c.body)
+  assert.deepEqual(JSON.parse(c.body), { size: 3 })
+
+  // 401 while a 64KB body is still being written: the JSON must arrive, not a reset
+  const s2 = JSON.parse((await raw('POST', '/u/init', { authorization: 'k', 'content-type': 'application/json' }, JSON.stringify({ filename: 'b', size: 64 * KB }))).body)
+  const early = await raw('PUT', `/u/${s2.uploadId}/0`, { 'content-type': 'application/octet-stream', 'content-length': String(64 * KB) }, crypto.randomBytes(64 * KB))
+  assert.equal(early.status, 401)
+  assert.equal(JSON.parse(early.body).code, 'unauthorized')
+  await app4.close()
+  fs.rmSync(store4.dir, { recursive: true, force: true })
 })
 
 test('octet-stream parser does not leak outside the plugin', async () => {

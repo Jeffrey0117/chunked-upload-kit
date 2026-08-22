@@ -28,10 +28,14 @@ registerChunkedUpload(app, {
   prefix: '/api/upload/chunked',
   store,
   auth: (req, reply) => getUserId(req) ?? null,           // null → 401
+  onInit: async (body, owner) => {                          // optional: refuse early
+    if (await overQuota(owner)) throw new ChunkError(413, 'quota', 'Storage full')
+  },
   onComplete: async (file, req) => {
     // file = { path, filename, mime, size, sha256, meta, owner, release() }
+    // req.completeBody = JSON the client sent with /complete (e.g. a password)
     const entry = await saveToYourStorage(file.path, file)
-    return { id: entry.id, url: entry.url }                  // ← becomes the HTTP response
+    return { id: entry.id, url: entry.url }                  // ← RETURN it; don't reply.send()
   },
 })
 ```
@@ -61,18 +65,19 @@ try {
   const result = await uploadChunked(file, {
     endpoint: '/api/upload/chunked',
     headers: { Authorization: 'Bearer ' + token },   // or getHeaders: async () => ({...})
-    meta: { album_id },                               // anything your onComplete needs
+    meta: { album_id },                               // stored with the session → file.meta
+    completeBody: { password },                       // sent only with /complete → req.completeBody
     onProgress: ({ loaded, total, percent }) => bar.style.width = percent + '%',
   })
   // result = whatever your onComplete returned
 } catch (err) {
-  if (err instanceof UploadError && err.uploadId) {
+  if (err instanceof UploadError && err.resumable) {
     // keep err.uploadId → uploadChunked(file, { ...opts, uploadId }) resumes, sending only missing chunks
   }
 }
 ```
 
-Browsers get real upload progress (XHR); Node uses `fetch`. Transient failures (network, 408/429/5xx) retry per chunk with exponential backoff; 4xx surface immediately as `UploadError { status, code, body, uploadId }`.
+Browsers get real upload progress (XHR, with a per-chunk timeout); Node uses `fetch`. Transient failures (network, 408/429/5xx) retry per chunk — and on `/complete` — with exponential backoff; 4xx surface immediately as `UploadError { status, code, body, uploadId, resumable }`.
 
 ## Protocol
 
@@ -81,12 +86,12 @@ Browsers get real upload progress (XHR); Node uses `fetch`. Transient failures (
 | init | `POST {prefix}/init` | `{filename,size,mime?,chunkSize?,sha256?,meta?}` | `{uploadId,chunkSize,totalChunks,received}` |
 | chunk | `PUT {prefix}/{uploadId}/{index}` | raw bytes, `application/octet-stream` | `{received,done}` |
 | status | `GET {prefix}/{uploadId}` | – | `{…,received}` (for resume) |
-| complete | `POST {prefix}/{uploadId}/complete` | – | your `onComplete` result |
+| complete | `POST {prefix}/{uploadId}/complete` | JSON (optional; e.g. secrets — exposed as `req.completeBody`) | your `onComplete` result |
 | abort | `DELETE {prefix}/{uploadId}` | – | `{ok:true}` |
 
-Errors are JSON `{error, code, …}`: `400 bad_chunk_length/bad_index/bad_size/…`, `401 unauthorized`, `403 forbidden` (another owner's session), `404 not_found`, `409 missing_chunks {missing}`, `413 too_large`, `422 hash_mismatch`.
+Errors are JSON `{error, code, …}`: `400 bad_chunk_length/bad_index/bad_size/…`, `401 unauthorized`, `403 forbidden` (another owner's session), `404 not_found`, `409 missing_chunks {missing}` / `409 completing`, `413 too_large`, `422 hash_mismatch`, `429 too_many_sessions`.
 
-Guarantees: every chunk must be exactly `chunkSize` bytes (last = remainder), re-PUT is idempotent, sessions are bound to the owner returned by `auth`, sessions persist on disk so a server restart does not lose an in-flight upload, and the assembled file's sha256 is always computed (verified against `sha256` if the client sent one) — handy for dedup.
+Guarantees: every chunk must be exactly `chunkSize` bytes (last = remainder), re-PUT is idempotent, `/complete` is single-flight and safe to retry (a second call joins the in-flight one), sessions are bound to the owner returned by `auth` and capped per owner (`maxSessionsPerOwner`, default 16), sessions persist on disk so a server restart does not lose an in-flight upload, and the assembled file's sha256 is always computed (verified against `sha256` if the client sent one) — handy for dedup. Use `onInit` to refuse (quota, permissions) before any byte lands.
 
 ## API
 

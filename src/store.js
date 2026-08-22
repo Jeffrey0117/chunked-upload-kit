@@ -19,7 +19,8 @@ const ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 const SHA256_RE = /^[0-9a-f]{64}$/i;
 const MAX_META_BYTES = 16 * 1024;
 // C0 control chars + DEL, built without escapes so no editor/tool can mangle them
-const CONTROL_CHARS = new RegExp("[" + String.fromCharCode(0) + "-" + String.fromCharCode(31) + String.fromCharCode(127) + "]", "g");
+const CONTROL_CHARS = new RegExp('[' + String.fromCharCode(0) + '-' + String.fromCharCode(31) + String.fromCharCode(127) + ']', 'g');
+const WIN_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i;
 
 class ChunkError extends Error {
   constructor(status, code, message, extra = {}) {
@@ -37,11 +38,21 @@ class ChunkError extends Error {
 const isInt = (n) => Number.isInteger(n);
 const normOwner = (o) => (o === undefined || o === null ? null : String(o));
 
+// Last path segment only, no control chars, no leading dots (so `..`/`.` and
+// dotfiles are out), no Windows-illegal chars, no reserved device names, no
+// trailing dots/spaces. Safe to path.join() under a directory you control.
 function sanitizeFilename(name) {
   if (typeof name !== 'string') return '';
-  // keep only the last path segment, drop control chars, cap length
-  const base = name.split(/[\\/]/).pop() || '';
-  return base.replace(CONTROL_CHARS, '').trim().slice(0, 255);
+  let base = name.split(/[\\/]/).pop() || '';
+  base = base
+    .replace(CONTROL_CHARS, '')
+    .replace(/^\.+/, '')
+    .replace(/[:*?"<>|]/g, '_')
+    .replace(/[. ]+$/, '')
+    .trim()
+    .slice(0, 255);
+  if (WIN_RESERVED.test(base)) base = `_${base}`;
+  return base;
 }
 
 function createChunkStore(opts = {}) {
@@ -52,6 +63,7 @@ function createChunkStore(opts = {}) {
   const minChunkSize = opts.minChunkSize ?? 1024;
   const maxFileSize = opts.maxFileSize ?? 2 * 1024 * MB;
   const maxChunks = opts.maxChunks ?? 4096;
+  const maxSessionsPerOwner = opts.maxSessionsPerOwner ?? 16;
   const ttlMs = opts.ttlMs ?? 24 * 60 * 60 * 1000;
   const log = opts.log || (() => {});
 
@@ -59,7 +71,11 @@ function createChunkStore(opts = {}) {
 
   fs.mkdirSync(dir, { recursive: true });
 
-  const sessions = new Map(); // uploadId → meta (cache; disk is the truth)
+  // uploadId → meta. Disk is the truth; this is a cache plus the in-memory
+  // `received` set (so chunk PUTs don't readdir on every call).
+  const sessions = new Map();
+  const completing = new Map(); // uploadId → in-flight complete() promise
+  let indexed = false; // have we scanned the dir once (for per-owner counts)?
 
   const sessionDir = (id) => path.join(dir, id);
   const partPath = (id, i) => path.join(sessionDir(id), `${i}.part`);
@@ -73,6 +89,49 @@ function createChunkStore(opts = {}) {
     return null;
   }
 
+  async function scanReceived(meta) {
+    let names;
+    try {
+      names = await fsp.readdir(sessionDir(meta.uploadId));
+    } catch (_) {
+      return new Set();
+    }
+    const set = new Set();
+    for (const n of names) {
+      const m = /^(\d+)\.part$/.exec(n);
+      if (m && Number(m[1]) < meta.totalChunks) set.add(Number(m[1]));
+    }
+    return set;
+  }
+
+  async function receivedSet(meta) {
+    if (!meta._received) meta._received = await scanReceived(meta);
+    return meta._received;
+  }
+
+  const receivedList = async (meta) => [...(await receivedSet(meta))].sort((a, b) => a - b);
+
+  // Load every session dir once so per-owner limits are right after a restart.
+  async function ensureIndexed() {
+    if (indexed) return;
+    indexed = true;
+    let names = [];
+    try {
+      names = await fsp.readdir(dir, { withFileTypes: true });
+    } catch (_) { /* empty */ }
+    for (const ent of names) {
+      if (!ent.isDirectory() || !ID_RE.test(ent.name) || sessions.has(ent.name)) continue;
+      const meta = await readMeta(ent.name);
+      if (meta) sessions.set(ent.name, meta);
+    }
+  }
+
+  function countForOwner(owner) {
+    let n = 0;
+    for (const m of sessions.values()) if (m.owner === owner) n++;
+    return n;
+  }
+
   async function load(id, owner) {
     if (typeof id !== 'string' || !ID_RE.test(id)) throw new ChunkError(404, 'not_found', 'Upload session not found');
     let meta = sessions.get(id);
@@ -83,24 +142,6 @@ function createChunkStore(opts = {}) {
     }
     if (meta.owner !== normOwner(owner)) throw new ChunkError(403, 'forbidden', 'Upload session belongs to someone else');
     return meta;
-  }
-
-  async function received(meta) {
-    let names;
-    try {
-      names = await fsp.readdir(sessionDir(meta.uploadId));
-    } catch (_) {
-      return [];
-    }
-    const out = [];
-    for (const n of names) {
-      const m = /^(\d+)\.part$/.exec(n);
-      if (m) {
-        const i = Number(m[1]);
-        if (i < meta.totalChunks) out.push(i);
-      }
-    }
-    return out.sort((a, b) => a - b);
   }
 
   async function destroy(id) {
@@ -123,6 +164,12 @@ function createChunkStore(opts = {}) {
       received: rec,
     };
   }
+
+  // Persisted form of a session (drop in-memory-only fields).
+  const serialize = (meta) => {
+    const { _received, ...rest } = meta;
+    return JSON.stringify(rest);
+  };
 
   // ── API ──────────────────────────────────────────────────────────────────
 
@@ -162,6 +209,12 @@ function createChunkStore(opts = {}) {
       ? input.mime
       : 'application/octet-stream';
 
+    const ownerKey = normOwner(owner);
+    await ensureIndexed();
+    if (countForOwner(ownerKey) >= maxSessionsPerOwner) {
+      throw new ChunkError(429, 'too_many_sessions', `Too many uploads in progress (max ${maxSessionsPerOwner}); finish or abort one first`, { maxSessionsPerOwner });
+    }
+
     const uploadId = crypto.randomBytes(16).toString('base64url');
     const session = {
       uploadId,
@@ -172,24 +225,26 @@ function createChunkStore(opts = {}) {
       totalChunks,
       sha256,
       meta,
-      owner: normOwner(owner),
+      owner: ownerKey,
       createdAt: Date.now(),
+      _received: new Set(),
     };
     await fsp.mkdir(sessionDir(uploadId), { recursive: true });
-    await fsp.writeFile(path.join(sessionDir(uploadId), 'meta.json'), JSON.stringify(session));
+    await fsp.writeFile(path.join(sessionDir(uploadId), 'meta.json'), serialize(session));
     sessions.set(uploadId, session);
     return { uploadId, chunkSize, totalChunks, received: [] };
   }
 
   async function status(id, owner) {
     const meta = await load(id, owner);
-    return publicStatus(meta, await received(meta));
+    return publicStatus(meta, await receivedList(meta));
   }
 
   // `source` is a Buffer or a Readable. `hint.length` (e.g. Content-Length) lets
   // us fail before reading anything when the caller already knows it is wrong.
   async function putChunk(id, index, source, owner, hint = {}) {
     const meta = await load(id, owner);
+    if (completing.has(id)) throw new ChunkError(409, 'completing', 'Upload is already being finalized');
     const i = typeof index === 'string' && /^\d+$/.test(index) ? Number(index) : index;
     if (!isInt(i) || i < 0 || i >= meta.totalChunks) {
       throw new ChunkError(400, 'bad_index', `index must be an integer between 0 and ${meta.totalChunks - 1}`);
@@ -227,21 +282,39 @@ function createChunkStore(opts = {}) {
       throw err;
     }
 
-    const rec = await received(meta);
-    return { received: rec, done: rec.length === meta.totalChunks };
+    const set = await receivedSet(meta);
+    set.add(i);
+    return { received: [...set].sort((a, b) => a - b), done: set.size === meta.totalChunks };
   }
 
-  async function complete(id, owner) {
+  // Single-flight per uploadId: a retried /complete (proxy 5xx, client timeout)
+  // joins the in-flight assembly instead of racing it.
+  function complete(id, owner) {
+    const key = typeof id === 'string' ? id : '';
+    const inflight = completing.get(key);
+    if (inflight) {
+      return inflight.then((res) => {
+        // still enforce ownership for the joining caller
+        if (res.owner !== normOwner(owner)) throw new ChunkError(403, 'forbidden', 'Upload session belongs to someone else');
+        return res;
+      });
+    }
+    const p = doComplete(id, owner).finally(() => completing.delete(key));
+    if (key) completing.set(key, p);
+    return p;
+  }
+
+  async function doComplete(id, owner) {
     const meta = await load(id, owner);
-    const rec = await received(meta);
-    if (rec.length !== meta.totalChunks) {
-      const have = new Set(rec);
+    const rec = await receivedSet(meta);
+    if (rec.size !== meta.totalChunks) {
       const missing = [];
-      for (let i = 0; i < meta.totalChunks; i++) if (!have.has(i)) missing.push(i);
-      throw new ChunkError(409, 'missing_chunks', `${missing.length} chunk(s) still missing`, { missing, received: rec });
+      for (let i = 0; i < meta.totalChunks; i++) if (!rec.has(i)) missing.push(i);
+      throw new ChunkError(409, 'missing_chunks', `${missing.length} chunk(s) still missing`, { missing, received: [...rec].sort((a, b) => a - b) });
     }
 
     const assembled = path.join(sessionDir(id), 'assembled');
+    const tmp = `${assembled}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
     const hash = crypto.createHash('sha256');
     const hasher = new Transform({
       transform(chunk, _enc, cb) {
@@ -254,7 +327,13 @@ function createChunkStore(opts = {}) {
         yield* fs.createReadStream(partPath(id, i));
       }
     };
-    await pipeline(Readable.from(parts()), hasher, fs.createWriteStream(assembled));
+    try {
+      await pipeline(Readable.from(parts()), hasher, fs.createWriteStream(tmp));
+      await fsp.rename(tmp, assembled);
+    } catch (err) {
+      await fsp.rm(tmp, { force: true }).catch(() => {});
+      throw err;
+    }
 
     const st = await fsp.stat(assembled);
     const sha256 = hash.digest('hex');
@@ -285,6 +364,7 @@ function createChunkStore(opts = {}) {
 
   async function abort(id, owner) {
     await load(id, owner);
+    if (completing.has(id)) throw new ChunkError(409, 'completing', 'Upload is already being finalized');
     await destroy(id);
     return { ok: true };
   }
@@ -299,7 +379,8 @@ function createChunkStore(opts = {}) {
     let removed = 0;
     for (const ent of names) {
       if (!ent.isDirectory() || !ID_RE.test(ent.name)) continue;
-      const meta = await readMeta(ent.name);
+      if (completing.has(ent.name)) continue;
+      const meta = (await readMeta(ent.name)) || sessions.get(ent.name); // disk is the truth
       let createdAt = meta ? meta.createdAt : null;
       if (!isInt(createdAt)) {
         try { createdAt = (await fsp.stat(sessionDir(ent.name))).mtimeMs; } catch (_) { continue; }
@@ -327,7 +408,7 @@ function createChunkStore(opts = {}) {
 
   return {
     dir,
-    limits: { defaultChunkSize, maxChunkSize, minChunkSize, maxFileSize, maxChunks, ttlMs },
+    limits: { defaultChunkSize, maxChunkSize, minChunkSize, maxFileSize, maxChunks, maxSessionsPerOwner, ttlMs },
     init,
     status,
     putChunk,

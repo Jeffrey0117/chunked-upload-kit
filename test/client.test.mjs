@@ -104,10 +104,56 @@ test('resume: a second call with uploadId only sends the missing chunks', async 
 
   const puts = []
   const countingFetch = (url, init) => { if (init?.method === 'PUT') puts.push(url); return fetch(url, init) }
-  const result = await uploadChunked(new Blob([data]), { endpoint, headers, uploadId: firstId, fetch: countingFetch, useXhr: false })
+  const result = await uploadChunked(new Blob([data]), { endpoint, headers, filename: 'r.bin', uploadId: firstId, fetch: countingFetch, useXhr: false })
   assert.equal(result.filename, 'r.bin')
   assert.equal(puts.length, 3 - st.received.length)
   assert.ok(received[0].bytes.equals(data))
+})
+
+test('abort signal fired between chunks settles (no hang) and marks the error resumable', async () => {
+  const data = crypto.randomBytes(12 * KB)
+  const ac = new AbortController()
+  let calls = 0
+  const gateFetch = (url, init) => {
+    if (init?.method === 'PUT') { calls++; if (calls === 1) ac.abort() }
+    return fetch(url, init)
+  }
+  const t = setTimeout(() => { throw new Error('hung') }, 10_000)
+  await assert.rejects(
+    uploadChunked(new Blob([data]), { endpoint, headers, filename: 'h.bin', concurrency: 1, signal: ac.signal, fetch: gateFetch, useXhr: false }),
+    (err) => err.code === 'aborted' && err.resumable === true && !!err.uploadId,
+  )
+  clearTimeout(t)
+})
+
+test('resume refuses a different file with the same size (filename mismatch)', async () => {
+  const data = crypto.randomBytes(4 * KB)
+  const s = await (await fetch(`${endpoint}/init`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ filename: 'one.bin', size: data.length }) })).json()
+  await assert.rejects(
+    uploadChunked(new Blob([data]), { endpoint, headers, filename: 'two.bin', uploadId: s.uploadId }),
+    (err) => err.code === 'resume_mismatch',
+  )
+  await abortUpload(s.uploadId, { endpoint, headers })
+})
+
+test('/complete is retried on a transient 5xx and non-resumable 4xx errors say so', async () => {
+  received = []
+  const data = crypto.randomBytes(5 * KB)
+  let completes = 0
+  const flakyComplete = (url, init) => {
+    if (init?.method === 'POST' && url.endsWith('/complete') && completes++ === 0) {
+      return Promise.resolve(new Response(JSON.stringify({ error: 'bad gateway' }), { status: 502 }))
+    }
+    return fetch(url, init)
+  }
+  const r = await uploadChunked(new Blob([data]), { endpoint, headers, filename: 'c.bin', fetch: flakyComplete, useXhr: false, retryDelayMs: 5 })
+  assert.equal(r.filename, 'c.bin')
+  assert.equal(completes, 2)
+
+  await assert.rejects(
+    uploadChunked(new Blob([crypto.randomBytes(1024 * KB)]), { endpoint, headers, filename: 'huge' }),
+    (err) => err.status === 413 && err.resumable === false,
+  )
 })
 
 test('abortUpload cleans up server state and never throws', async () => {

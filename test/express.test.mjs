@@ -70,7 +70,7 @@ test('errors come back as JSON with status + code', async () => {
   assert.equal((await bad.json()).code, 'bad_chunk_length')
   const other = await fetch(`${base}/${s.uploadId}`, { headers: { 'x-user': 'u2' } })
   assert.equal(other.status, 403)
-  const badJson = await fetch(`${base}/init`, { method: 'POST', headers: H, body: '{not json' })
+  const badJson = await fetch(`${base}/init`, { method: 'POST', headers: { ...H, 'content-type': 'application/json' }, body: '{not json' })
   assert.equal(badJson.status, 400)
   assert.equal((await badJson.json()).code, 'bad_json')
   const del = await fetch(`${base}/${s.uploadId}`, { method: 'DELETE', headers: H })
