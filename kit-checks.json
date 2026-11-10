@@ -1,0 +1,47 @@
+{
+  "_schema": "kit-kit audit.js 的格式：{ id, rule, fix, pattern, files, severity }。pattern 與 files 都是 JS RegExp 字串（無 flags，所以大小寫要自己列舉），pattern 逐行比對，files 比對專案內的相對路徑。audit 本身已排除 *.md / test/ / docs/ / example.js / kit-checks.json，也不會把「本身就是獨立受稽核專案」的子目錄算進來。",
+  "_files_note": "除了 test/ 這類目錄，也排除根目錄的 test-*.js / *-test.js 腳本：專案常把一次性驗證腳本放在根目錄，裡面會刻意塞超大 chunkSize、用 tmpdir 當暫存來驗邊界。報它們等於懲罰有寫測試的專案（實測 paygate 就因此誤報過）。",
+  "_pattern_note": "每條 pattern 都以 ^(?!\\s*(?:\\*|//|/\\*|#)) 開頭，跳過純註解行 —— 專案常會把「舊的壞寫法長這樣」寫在註解裡當說明，那不該被報成違規。",
+  "checks": [
+    {
+      "id": "chunk-size-over-proxy-limit",
+      "severity": "high",
+      "pattern": "^(?!\\s*(?:\\*|//|/\\*|#)).*(?:(?:maxChunkSize|chunkSize)\\s*[:=]\\s*(?:[1-9]\\d{8,}|(?:1[0-9]{2}|[2-9][0-9]{2}|[0-9]{4,})\\s*\\*\\s*1024\\s*\\*\\s*1024))",
+      "files": "^(?!.*(?:(?:^|/)(?:test|tests|e2e|scripts|__tests__|__mocks__|fixtures)/))(?!(?:.*/)?test-[^/]*$)(?!(?:.*/)?[^/]*-test\\.[jt]sx?$)(?!.*(?:__tests__|__mocks__|\\.test\\.|\\.spec\\.|\\.fixture\\.|node_modules|\\.next/|dist/|build/|coverage/)).*\\.(js|cjs|mjs|ts|tsx)$",
+      "rule": "chunkSize / maxChunkSize 超過 proxy 的單一 request 上限，整套切塊就白做了 —— Cloudflare 非 Enterprise 是 100MB/request，超過的話 request 根本到不了 origin，邊緣就回 413（去查 tunnel / app log 會一無所獲）。",
+      "fix": "預設 chunkSize 16MB、maxChunkSize 32MB 是刻意留餘裕的，別往上調過 64MB。"
+    },
+    {
+      "id": "chunk-store-in-os-tmpdir",
+      "severity": "high",
+      "pattern": "^(?!\\s*(?:\\*|//|/\\*|#)).*(?:(?:dir|chunkDir|sessionDir)\\s*:\\s*(?:[A-Za-z_$][\\w$]*\\.)?tmpdir\\(\\)|createChunkStore\\([^)]*tmpdir\\(\\))",
+      "files": "^(?!.*(?:(?:^|/)(?:test|tests|e2e|scripts|__tests__|__mocks__|fixtures)/))(?!(?:.*/)?test-[^/]*$)(?!(?:.*/)?[^/]*-test\\.[jt]sx?$)(?!.*(?:__tests__|__mocks__|\\.test\\.|\\.spec\\.|\\.fixture\\.|node_modules|\\.next/|dist/|build/|coverage/)).*\\.(js|cjs|mjs|ts|tsx)$",
+      "rule": "chunk session 目錄放在 os.tmpdir()：部署會清掉（傳到一半的檔案直接消失），而且跨磁碟 rename 會退化成整檔 copy。",
+      "fix": "放進專案自己的資料目錄，例如 createChunkStore({ dir: join(dataDir, 'chunks') })。"
+    },
+    {
+      "id": "chunk-temp-path-persisted",
+      "severity": "high",
+      "pattern": "^(?!\\s*(?:\\*|//|/\\*|#))(?=.*(?:\\b(?:db|prisma|knex|sequelize|mongoose|sqlite|stmt)\\b|INSERT INTO|\\.(?:insert|create|update|save|run|put)\\())(?=.*(?:path|filePath|file_path|storedPath)\\s*:\\s*(?:file|f)\\.path\\b).*",
+      "files": "^(?!.*(?:(?:^|/)(?:test|tests|e2e|scripts|__tests__|__mocks__|fixtures)/))(?!(?:.*/)?test-[^/]*$)(?!(?:.*/)?[^/]*-test\\.[jt]sx?$)(?!.*(?:__tests__|__mocks__|\\.test\\.|\\.spec\\.|\\.fixture\\.|node_modules|\\.next/|dist/|build/|coverage/)).*\\.(js|cjs|mjs|ts|tsx)$",
+      "rule": "把 onComplete 的 file.path 寫進資料庫。那個路徑在 onComplete 回傳之後就被刪掉了，之後讀到的是不存在的檔案。（只在同一行同時看到資料庫動作時才報 —— 把 file.path 當參數傳給落檔函式是正確寫法，不在此列。）",
+      "fix": "在 onComplete 裡 rename / copy 到正式位置，存那個新路徑。"
+    },
+    {
+      "id": "chunk-meta-carries-secret",
+      "severity": "high",
+      "pattern": "^(?!\\s*(?:\\*|//|/\\*|#)).*(?:meta\\s*:\\s*\\{[^}]*(?:password|passwd|secret|apiKey|api_key|token))",
+      "files": "^(?!.*(?:(?:^|/)(?:test|tests|e2e|scripts|__tests__|__mocks__|fixtures)/))(?!(?:.*/)?test-[^/]*$)(?!(?:.*/)?[^/]*-test\\.[jt]sx?$)(?!.*(?:__tests__|__mocks__|\\.test\\.|\\.spec\\.|\\.fixture\\.|node_modules|\\.next/|dist/|build/|coverage/)).*\\.(js|cjs|mjs|ts|tsx|jsx|mts)$",
+      "rule": "meta 會以 meta.json 落地到 chunk session 目錄，所以密碼這類機敏值放進 meta 等於寫到磁碟（上傳失敗的 session 還會留著一陣子）。",
+      "fix": "機敏值放 completeBody —— 它只跟著最後一個 request 走，不落地。"
+    },
+    {
+      "id": "chunk-threshold-too-low",
+      "severity": "warn",
+      "pattern": "^(?!\\s*(?:\\*|//|/\\*|#)).*(?:(?:CHUNK_THRESHOLD|chunkThreshold)\\s*[:=]\\s*(?:(?:\\d{1,6}|[1-7]\\d{6})(?!\\s*\\*)|[1-7]\\s*\\*\\s*1024\\s*\\*\\s*1024)\\b)",
+      "files": "^(?!.*(?:(?:^|/)(?:test|tests|e2e|scripts|__tests__|__mocks__|fixtures)/))(?!(?:.*/)?test-[^/]*$)(?!(?:.*/)?[^/]*-test\\.[jt]sx?$)(?!.*(?:__tests__|__mocks__|\\.test\\.|\\.spec\\.|\\.fixture\\.|node_modules|\\.next/|dist/|build/|coverage/)).*\\.(js|cjs|mjs|ts|tsx|jsx|mts)$",
+      "rule": "切塊門檻設太低（<8MB），小檔也被切成好幾個往返 —— 小檔走單一 request 最便宜，塊數一多還更容易撞到全域 rate limit。",
+      "fix": "門檻取 32~64MB；小檔繼續走原本那條單一 request 的路由。"
+    }
+  ]
+}
