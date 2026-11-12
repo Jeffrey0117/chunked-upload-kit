@@ -1,0 +1,10 @@
+{
+  "repo": 1,
+  "name": "chunked-upload-kit",
+  "what": "Chunked/resumable file upload — zero-dep server store + fastify/express adapters + browser/Node client. Gets large files past proxies that cap request bodies (e.g. Cloudflare 100MB).",
+  "kind": "kit",
+  "work": {
+    "guide": "README.md",
+    "test": "npm test"
+  }
+}
