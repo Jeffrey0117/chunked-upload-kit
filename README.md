@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.svg" width="96" height="96" alt="chunked-upload-kit logo">
+</p>
+
 # chunked-upload-kit
 
 **Chunked / resumable uploads that survive request-body caps** — Cloudflare's 100 MB limit, nginx `client_max_body_size`, serverless payload limits. Zero runtime dependencies, framework-agnostic core, thin fastify/express adapters, one browser+Node client.
