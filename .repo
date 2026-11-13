@@ -6,5 +6,37 @@
   "work": {
     "guide": "README.md",
     "test": "npm test"
-  }
+  },
+  "offers": [
+    {
+      "id": "chunk_store",
+      "what": "與框架無關的分片上傳核心：createChunkStore({ dir, maxFileSize, maxChunkSize }) 回傳 { init, status, putChunk, complete, abort, sweep, startSweeper }，session 存在磁碟、重啟不掉。不用 fastify/express（Koa/Hono/原生 http）時直接用它；maxChunkSize 一定要小於前面 proxy 的 body 上限。",
+      "how": "import",
+      "import": "const { createChunkStore, ChunkError, sanitizeFilename } = require('chunked-upload-kit')"
+    },
+    {
+      "id": "fastify_adapter",
+      "what": "在 fastify 上掛好 init / chunk / status / complete / abort 五條路由：registerChunkedUpload(app, { prefix, store, auth, onInit, onComplete })。大檔上傳要穿過 Cloudflare 100MB 這類 body 上限時用；onComplete 的結果要 return，不要自己 reply.send()。",
+      "how": "import",
+      "import": "const { registerChunkedUpload, chunkedUploadPlugin } = require('chunked-upload-kit/fastify')"
+    },
+    {
+      "id": "express_adapter",
+      "what": "express / 原生 http 用的同一套分片上傳路由：app.use(prefix, chunkedUploadHandler({ store, auth, onComplete }))。不需要 express.json()，handler 自己解析 /init 的 body 並直接串流分片。",
+      "how": "import",
+      "import": "const { chunkedUploadHandler } = require('chunked-upload-kit/express')"
+    },
+    {
+      "id": "upload_client",
+      "what": "瀏覽器與 Node 共用的 ESM 上傳端：uploadChunked(file, { endpoint, headers, meta, completeBody, onProgress }) 切片平行送、逐片重試，回傳伺服器 onComplete 的結果。失敗時 UploadError.resumable 為真就留著 uploadId 再呼叫一次續傳，只補缺的分片；abortUpload 可取消。",
+      "how": "import",
+      "import": "import { uploadChunked, UploadError, abortUpload } from 'chunked-upload-kit/client'"
+    },
+    {
+      "id": "skill",
+      "what": "這個 kit 的打法。要上傳大檔（影片、壓縮包、超過 50MB）到自家服務，或上傳卡在個位數 %、Cloudflare 回 413 時先讀，不要再寫單一 multipart POST。",
+      "how": "skill",
+      "skill": "chunked-upload-kit"
+    }
+  ]
 }
