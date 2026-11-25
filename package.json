@@ -1,6 +1,6 @@
 {
   "name": "chunked-upload-kit",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Chunked/resumable file upload — zero-dep server store + fastify/express adapters + browser/Node client. Gets large files past proxies that cap request bodies (e.g. Cloudflare 100MB).",
   "main": "index.js",
   "types": "index.d.ts",

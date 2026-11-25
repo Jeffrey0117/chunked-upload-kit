@@ -5,6 +5,19 @@ export interface UploadProgress {
   uploadId: string
 }
 
+export interface UploadEvent {
+  type: 'ack-lost' | 'chunk-recovered' | 'chunk-retry'
+  uploadId: string
+  index: number
+  /** ack-lost: XHR readyState when the server confirmed the chunk, and how long the response had been missing. */
+  readyState?: number
+  waitedMs?: number
+  /** chunk-recovered / chunk-retry: what the failed request reported. */
+  code?: string
+  status?: number
+  attempt?: number
+}
+
 export interface UploadOptions {
   /** Base URL of the chunked upload routes, e.g. '/api/upload/chunked'. */
   endpoint: string
@@ -20,7 +33,15 @@ export interface UploadOptions {
   retryDelayMs?: number
   /** Per-chunk XHR timeout in ms (browser only). Default 120000; 0 disables. */
   chunkTimeoutMs?: number
+  /**
+   * Browser only. Once a chunk's bytes are out and no response has arrived, ask the
+   * server every this-many ms whether it has the chunk; if it does, move on instead
+   * of waiting for the timeout and re-sending. Default 5000; 0 disables.
+   */
+  ackProbeMs?: number
   onProgress?: (p: UploadProgress) => void
+  /** Diagnostics worth logging: a lost response, a chunk confirmed after a failed request, a retry. */
+  onEvent?: (e: UploadEvent) => void
   signal?: AbortSignal
   /** Arbitrary JSON stored with the session (on disk until complete) and passed to onComplete as file.meta. */
   meta?: Record<string, unknown>

@@ -163,3 +163,88 @@ test('abortUpload cleans up server state and never throws', async () => {
   assert.equal(await abortUpload('missing', { endpoint, headers }), false)
   assert.equal(await abortUpload('x', { endpoint: 'http://127.0.0.1:1/c' }), false)
 })
+
+// ── lost acknowledgements ────────────────────────────────────────────────────
+// Seen on an iPhone (2026-11-25, pokkit over plain-http LAN): the server stored
+// every chunk and answered 200, the browser never delivered the response. The
+// client waited out the 120s timeout and re-sent the same chunks, forever.
+
+// XHR stand-in: really PUTs the body, reports the upload as sent, and (while
+// `swallow` > 0) never delivers the response.
+function fakeXhrClass(state) {
+  return class FakeXhr {
+    constructor() {
+      this.readyState = 0; this.status = 0; this.responseText = ''; this.timeout = 0
+      this._h = {}; this._l = {}; this._ul = {}; this._done = false
+      this.upload = { addEventListener: (t, fn) => { (this._ul[t] ||= []).push(fn) } }
+    }
+    addEventListener(t, fn) { (this._l[t] ||= []).push(fn) }
+    _fire(map, t, e = {}) { for (const fn of map[t] || []) fn(e) }
+    open(method, url) { this._method = method; this._url = url; this.readyState = 1 }
+    setRequestHeader(k, v) { this._h[k] = v }
+    send(blob) {
+      state.puts.push(this._url)
+      const swallow = state.swallow > 0
+      if (swallow) state.swallow--
+      if (this.timeout > 0) this._t = setTimeout(() => { if (!this._done) { this._done = true; this._fire(this._l, 'timeout') } }, this.timeout)
+      fetch(this._url, { method: this._method, headers: this._h, body: blob }).then(async (res) => {
+        const text = await res.text()
+        if (this._done) return
+        this._fire(this._ul, 'progress', { lengthComputable: true, loaded: blob.size, total: blob.size })
+        this._fire(this._ul, 'load')
+        if (swallow) return // the response never reaches the page
+        this._done = true; clearTimeout(this._t)
+        this.status = res.status; this.responseText = text; this.readyState = 4
+        this._fire(this._l, 'load')
+      })
+    }
+    abort() { if (this._done) return; this._done = true; clearTimeout(this._t); this._fire(this._l, 'abort') }
+  }
+}
+
+test('a chunk the server stored but never acknowledged is not sent again', async () => {
+  received = []
+  const data = crypto.randomBytes(12 * KB) // 3 chunks
+  const state = { puts: [], swallow: 3 }
+  const events = []
+  const realXhr = globalThis.XMLHttpRequest
+  globalThis.XMLHttpRequest = fakeXhrClass(state)
+  const started = Date.now()
+  try {
+    const result = await uploadChunked(new Blob([data]), {
+      endpoint, headers, filename: 'lost-ack.mov', useXhr: true,
+      ackProbeMs: 30, chunkTimeoutMs: 4000, retryDelayMs: 5,
+      onEvent: (e) => events.push(e),
+    })
+    assert.equal(result.filename, 'lost-ack.mov')
+  } finally {
+    globalThis.XMLHttpRequest = realXhr
+  }
+  assert.ok(received[0].bytes.equals(data))
+  assert.equal(state.puts.length, 3, `each chunk goes up once, got ${state.puts.length} PUTs`)
+  assert.ok(Date.now() - started < 3000, 'must not wait for the chunk timeout')
+  assert.equal(events.filter((e) => e.type === 'ack-lost').length, 3)
+})
+
+test('a chunk that fails after the server stored it is confirmed instead of re-sent', async () => {
+  received = []
+  const data = crypto.randomBytes(12 * KB)
+  const puts = []
+  let drop = 2
+  const lossyFetch = async (url, init) => {
+    if (init?.method !== 'PUT') return fetch(url, init)
+    puts.push(url)
+    const res = await fetch(url, init)
+    if (drop > 0) { drop--; await res.text(); throw new TypeError('connection reset') }
+    return res
+  }
+  const events = []
+  const result = await uploadChunked(new Blob([data]), {
+    endpoint, headers, filename: 'reset.bin', fetch: lossyFetch, useXhr: false, retryDelayMs: 5, concurrency: 1,
+    onEvent: (e) => events.push(e),
+  })
+  assert.equal(result.filename, 'reset.bin')
+  assert.ok(received[0].bytes.equals(data))
+  assert.equal(puts.length, 3, `got ${puts.length} PUTs`)
+  assert.equal(events.filter((e) => e.type === 'chunk-recovered').length, 2)
+})

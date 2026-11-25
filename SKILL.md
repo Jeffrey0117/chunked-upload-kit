@@ -50,9 +50,12 @@ description: 任何「上傳大檔（影片/壓縮包/>50MB）到自家服務」
 - `onComplete` 回什麼，client 就拿到什麼 — 回和舊路由一模一樣的形狀，前端既有的成功處理直接複用。
 - `meta` 放一般表單欄位（到期、相簿…）；**密碼這種機敏值放 `completeBody`**（只跟著最後一個 request 走，不落地到 session 的 meta.json）。
 - **quota / 權限檢查放 `onInit`**，不要等到 `onComplete`（否則使用者傳完 500MB 才被拒，磁碟也白吃）。
+- **把 `onEvent` 接到你的前端 log / beacon**：`ack-lost`（塊送完了、伺服器也收了，但瀏覽器沒拿到回應）、`chunk-recovered`、`chunk-retry`。使用者只會說「卡在 32%」，這幾個事件才看得出卡在哪。
 - 失敗要不要續傳看 `err.resumable`：true（網路/5xx/abort）才留 `uploadId`；false（4xx）session 已經沒了，清掉 id 重來。
 
 ## 地雷
+
+- **「卡在 N% 不動，N 剛好是前幾塊的大小」＝回應掉了，不是伺服器沒收到**（2026-11-25 pokkit，iPhone 走 http 區網直連：伺服器三塊都存好也回了 200，手機一個回應都沒拿到，等滿 120 秒重送同樣三塊，無限循環）。client 0.2.0 起塊送完 5 秒沒回應會主動問伺服器（`ackProbeMs`），有收到就往下傳；失敗重送前也會先問。**複製到 `public/vendor/` 的 client 要跟著更新**，舊副本沒有這段。
 
 - **chunkSize / maxChunkSize 超過 proxy 上限整套白做**（CF 非 Enterprise = 100MB/request）。預設 32MB 上限是刻意的。
 - fastify 的 `application/octet-stream` parser 是 plugin 內部註冊（encapsulated），host app 不會被改行為；但如果你把 `registerChunkedUpload` 包在 `fastify-plugin` 裡就會外洩 — 別包。
