@@ -32,7 +32,7 @@ description: 任何「上傳大檔（影片/壓縮包/>50MB）到自家服務」
    ```
    express：`app.use('/api/upload/chunked', chunkedUploadHandler({ store, auth, onComplete }))`
 3. **把既有上傳路由的「落檔」邏輯抽成一個函式**（quota 檢查、圖/影片/一般檔分支、回傳格式），單檔路由和 `onComplete` 都呼叫它 — 兩條路的回傳 JSON 才會同形，前端不用分兩套處理。
-4. client：把 `client/index.mjs` 複製到 `public/vendor/`（或 bundler import），
+4. client：**有打包的專案（Next.js 等）直接 `import { uploadChunked } from 'chunked-upload-kit/client'`，不要抄檔**（coursebloom 抄過一份，kit 修了 bug 它沒跟到）。沒打包、直接丟檔案給瀏覽器的專案才把 `client/index.mjs` 複製到 `public/vendor/`，
    ```html
    <script type="module">
      import { uploadChunked } from './vendor/chunked-upload-client.mjs'
@@ -54,6 +54,8 @@ description: 任何「上傳大檔（影片/壓縮包/>50MB）到自家服務」
 - 失敗要不要續傳看 `err.resumable`：true（網路/5xx/abort）才留 `uploadId`；false（4xx）session 已經沒了，清掉 id 重來。
 
 ## 地雷
+
+- **npm 上的 `chunked-upload-kit` 不是這個 kit**（別人 2026-11-20 註冊的同名套件）。依賴一律寫 `github:Jeffrey0117/chunked-upload-kit`，絕對不要寫成版本號（`^0.2.0`），不然裝到的是陌生人的程式。
 
 - **「卡在 N% 不動，N 剛好是前幾塊的大小」＝回應掉了，不是伺服器沒收到**（2026-11-25 pokkit，iPhone 走 http 區網直連：伺服器三塊都存好也回了 200，手機一個回應都沒拿到，等滿 120 秒重送同樣三塊，無限循環）。client 0.2.0 起塊送完 5 秒沒回應會主動問伺服器（`ackProbeMs`），有收到就往下傳；失敗重送前也會先問。**複製到 `public/vendor/` 的 client 要跟著更新**，舊副本沒有這段。
 
