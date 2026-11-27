@@ -83,6 +83,10 @@ try {
 
 Browsers get real upload progress (XHR, with a per-chunk timeout); Node uses `fetch`. Transient failures (network, 408/429/5xx) retry per chunk — and on `/complete` — with exponential backoff; 4xx surface immediately as `UploadError { status, code, body, uploadId, resumable }`.
 
+### Fast uploads at home (`lan`)
+
+For services hosted at home behind a tunnel, uploading *from home* goes out to the edge and back. If the server also answers on a LAN host (a public name pointing at the home IP with a real certificate, e.g. CloudPipe's `lan-gateway`), pass `lan: true` (derives `https://<app>.lan.<zone>` from `location`) or `lan: 'https://…'`. The client asks `<lan>/__lan/ping` once (1.5 s budget, cached 5 min) and sends the bytes there when it answers; otherwise nothing changes. Needs a relative `endpoint` and token (header) auth. Standalone: `client/lan-probe.js` (`LanProbe.probeLan`, `LanProbe.lanBaseFor`).
+
 ## Protocol
 
 | Step | Route | Body | Response |

@@ -53,6 +53,19 @@ description: 任何「上傳大檔（影片/壓縮包/>50MB）到自家服務」
 - **把 `onEvent` 接到你的前端 log / beacon**：`ack-lost`（塊送完了、伺服器也收了，但瀏覽器沒拿到回應）、`chunk-recovered`、`chunk-retry`。使用者只會說「卡在 32%」，這幾個事件才看得出卡在哪。
 - 失敗要不要續傳看 `err.resumable`：true（網路/5xx/abort）才留 `uploadId`；false（4xx）session 已經沒了，清掉 id 重來。
 
+## 在家高速上傳（0.3.0）
+
+服務架在家裡、經 Cloudflare tunnel 對外時，**人在家上傳反而最慢**：檔案要先出去 CF 再繞回來（實測 2.4 MB/s；走家裡網路 21.7 MB/s，約 9 倍）。
+
+- 伺服器那半：CloudPipe 的 `lan-gateway`（`src/core/lan-gateway.js`）已經替所有專案開好 `https://<id>.lan.<網域>`：公開 DNS 指到家裡 IP、真憑證、轉給原本的服務。**專案本身不用改。**
+- 前端：`uploadChunked(file, { endpoint: '/api/upload/chunked', lan: true, ... })`。上傳開始時問一次 `/__lan/ping`（1.5 秒內沒回就當不在家），在家就把位元組送去 LAN 網址，不在家一切照舊。結果記在 sessionStorage 5 分鐘。
+- 自己寫的上傳（不用 uploadChunked）：`<script src="lan-probe.js">` 後 `const base = await LanProbe.probeLan(LanProbe.lanBaseFor(location.hostname))`，把 `(base || '') + '/upload'` 當網址。
+- 地雷：
+  - **endpoint 要是相對路徑**（`/api/...`）才會換；寫死完整網址就不會走家裡。
+  - 登入要用 `Authorization` 標頭帶 token。**靠 cookie 登入的不會跨網域帶過去**，那種先改成帶 token 再接。
+  - 只在**開始上傳時**問，不要一進頁面就問：Chrome 會跳一次「允許存取區域網路裝置？」，在上傳當下問才有意義。
+  - 頁面本身留在公開網址，只有上傳的位元組換路，所以上傳完的回應、之後的頁面都不受影響。
+
 ## 地雷
 
 - **npm 上的 `chunked-upload-kit` 不是這個 kit**（別人 2026-11-20 註冊的同名套件）。依賴一律寫 `github:Jeffrey0117/chunked-upload-kit`，絕對不要寫成版本號（`^0.2.0`），不然裝到的是陌生人的程式。

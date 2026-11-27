@@ -33,6 +33,12 @@
       "import": "import { uploadChunked, UploadError, abortUpload } from 'chunked-upload-kit/client'"
     },
     {
+      "id": "lan_probe",
+      "what": "在家高速上傳：服務架在家裡經 tunnel 對外時，在家上傳改走家裡網路（實測快約 9 倍）。uploadChunked 加 lan: true 即可；自己寫的上傳用 LanProbe.probeLan(LanProbe.lanBaseFor(location.hostname)) 拿到 LAN 網址或 null。伺服器那半是 CloudPipe lan-gateway。",
+      "how": "import",
+      "import": "import { probeLan, lanBaseFor } from 'chunked-upload-kit/client'  // 或 <script src=\"client/lan-probe.js\"> → window.LanProbe"
+    },
+    {
       "id": "skill",
       "what": "這個 kit 的打法。要上傳大檔（影片、壓縮包、超過 50MB）到自家服務，或上傳卡在個位數 %、Cloudflare 回 413 時先讀，不要再寫單一 multipart POST。",
       "how": "skill",
