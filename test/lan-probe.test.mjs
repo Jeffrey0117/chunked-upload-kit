@@ -69,3 +69,18 @@ test('uploadChunked({ lan }) sends to the LAN host when it answers, stays put wh
     assert.ok(urls[1].startsWith(expectPrefix), `${urls[1]} should start with ${expectPrefix}`)
   }
 })
+
+test('Chrome still asking "allow local network?" → a timeout is not remembered as "not home"', async () => {
+  const saved = globalThis.navigator
+  Object.defineProperty(globalThis, 'navigator', { value: { permissions: { query: async () => ({ state: 'prompt' }) } }, configurable: true })
+  try {
+    let calls = 0
+    const storage = memStorage()
+    const fetch = async () => { calls++; throw new TypeError('Failed to fetch') }
+    await probeLan('https://a.lan.example.com', { fetch, storage })
+    await probeLan('https://a.lan.example.com', { fetch, storage })
+    assert.equal(calls, 2)
+  } finally {
+    Object.defineProperty(globalThis, 'navigator', { value: saved, configurable: true })
+  }
+})

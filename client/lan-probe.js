@@ -40,13 +40,15 @@
     try { storage.setItem(key, JSON.stringify({ ok: ok, until: now + cacheMs })); } catch (e) { /* private mode */ }
   }
 
+  var PROMPT_BUDGET_MS = 20000;
+
   /** How long to wait: Chrome's "allow local network?" question needs time for a human to answer. */
   function waitBudget(defaultMs) {
     var perms = root.navigator && root.navigator.permissions;
     if (!perms || !perms.query) return Promise.resolve(defaultMs);
     return perms.query({ name: 'local-network-access' }).then(function (s) {
       if (s.state === 'denied') return 0;
-      if (s.state === 'prompt') return 20000;
+      if (s.state === 'prompt') return PROMPT_BUDGET_MS;
       return defaultMs;
     }, function () { return defaultMs; });   // browser doesn't know that permission → normal budget
   }
@@ -75,7 +77,8 @@
         .then(function (r) { return r && r.ok; }, function () { return false; })
         .then(function (ok) {
           clearTimeout(timer);
-          if (storage) cacheSet(storage, key, ok, (opts.now || Date.now)(), cacheMs);
+          // a "no" while Chrome's question was still on screen isn't an answer — ask again next upload
+          if (storage && (ok || budget !== PROMPT_BUDGET_MS)) cacheSet(storage, key, ok, (opts.now || Date.now)(), cacheMs);
           return ok ? lanBase : null;
         });
     });
